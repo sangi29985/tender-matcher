@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Tender Matcher</title>
+    <style>
+      :root { --ink: #172033; --muted: #5b6575; --line: #ccd3df; --bg: #f6f7fa; --accent: #1f4fd1; }
+      * { box-sizing: border-box; }
+      body { font: 16px/1.5 system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; color: var(--ink); background: #fff; }
+      h1 { margin-bottom: .25rem; }
+      .muted { color: var(--muted); }
+      .panel { border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; margin: 1.25rem 0; background: var(--bg); }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .75rem 1rem; }
+      label { display: block; font-weight: 600; font-size: .9rem; }
+      label span { display: block; font-weight: 400; color: var(--muted); font-size: .8rem; }
+      input, textarea, select { width: 100%; font: inherit; padding: .45rem .55rem; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+      textarea { min-height: 80px; }
+      .wide { grid-column: 1 / -1; }
+      button { padding: .55rem .9rem; margin: .25rem .25rem .25rem 0; cursor: pointer; border: 1px solid var(--line); border-radius: 6px; background: #fff; font: inherit; }
+      button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+      button:disabled { opacity: .6; cursor: progress; }
+      .steps { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
+      #status { min-height: 1.5rem; font-weight: 600; }
+      .card { border: 1px solid var(--line); border-radius: 10px; padding: 1rem 1.25rem; margin: 1rem 0; }
+      .card h3 { margin: 0 0 .25rem; }
+      .strong { border-left: 6px solid #17834c; } .possible { border-left: 6px solid #d99612; } .no { border-left: 6px solid #b63c3c; }
+      .badge { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .8rem; font-weight: 700; color: #fff; }
+      .badge.strong { background: #17834c; border: 0; } .badge.possible { background: #a36d00; border: 0; } .badge.no { background: #b63c3c; border: 0; }
+      .meta { color: var(--muted); font-size: .9rem; }
+      blockquote { margin: .15rem 0 .4rem; padding-left: .75rem; border-left: 3px solid var(--line); color: var(--muted); font-size: .9rem; }
+      .feedback { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; margin-top: .5rem; }
+      .feedback select { width: auto; }
+      details summary { cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <h1>Tender Matcher</h1>
+    <p class="muted">Decision support only. Always confirm eligibility, dates and bid details in the official notice on SAM.gov.</p>
+
+    <section class="panel">
+      <h2>1. Company profile</h2>
+      <form id="profile-form" class="grid">
+        <label class="wide">Services you deliver <span>Comma-separated, e.g. cloud migration, IT helpdesk</span>
+          <input name="services" required></label>
+        <label>NAICS codes <span>Comma-separated</span><input name="naics_codes"></label>
+        <label>Set-aside eligibility <span>SAM.gov codes, e.g. SBA, WOSB, 8A, HZC, SDVOSBC</span><input name="set_aside_eligibility"></label>
+        <label>Locations served <span>States (VA or Virginia), or "remote"</span><input name="locations_served"></label>
+        <label>Contract size min (USD)<input name="size_min" type="number" min="0" required></label>
+        <label>Contract size max (USD)<input name="size_max" type="number" min="1" required></label>
+        <label>Certifications <span>Comma-separated</span><input name="certifications"></label>
+        <label>Clearances <span>Comma-separated</span><input name="clearances"></label>
+        <label>Exclusions <span>Work you never take on</span><input name="exclusions"></label>
+        <label class="wide">Past contracts <span>One per line: client | what you did | value in USD (optional)</span>
+          <textarea name="past_contracts"></textarea></label>
+        <div class="wide"><button class="primary" type="submit">Save profile</button><span id="profile-version" class="muted"></span></div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>2. Find tenders</h2>
+      <div class="steps">
+        <button id="sync" onclick="syncNotices()">Sync SAM.gov (last 3 days)</button>
+        <button id="run" class="primary" onclick="runDigest()">Build digest</button>
+        <button onclick="loadDigest()">Refresh</button>
+      </div>
+      <p class="muted">Building the digest reads each shortlisted notice with the AI judge. Notices already judged for this profile are reused, so re-running is fast.</p>
+      <p id="status" role="status"></p>
+      <details id="skipped-box" hidden><summary id="skipped-title"></summary><ul id="skipped"></ul></details>
+    </section>
+
+    <h2>3. Digest</h2>
+    <section id="digest"><p class="muted">No matches yet.</p></section>
+
+    <script>
+      const sampleProfile = {
+        services: ["cloud migration", "custom web applications", "IT helpdesk"],
+        naics_codes: ["541511", "541512", "541519"],
+        set_aside_eligibility: ["SBA", "WOSB"],
+        locations_served: ["VA", "MD", "DC", "remote"],
+        contract_size_usd: { min: 25000, max: 2000000 },
+        certifications: ["ISO 27001"], clearances: [], past_contracts: [],
+        exclusions: ["hardware supply", "construction"]
+      };
+      const listFields = ["services", "naics_codes", "set_aside_eligibility", "locations_served", "certifications", "clearances", "exclusions"];
+      const form = document.querySelector("#profile-form");
+      const status = (message) => { document.querySelector("#status").textContent = message; };
+
+      async function request(url, options = {}) {
+        const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
+        const text = await response.text();
+        let data = null;
+        try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+        if (!response.ok) {
+          const detail = data && data.detail;
+          const message = Array.isArray(detail) ? detail.map(item => item.msg).join("; ") : detail;
+          throw new Error(message || `Request failed (${response.status})`);
+        }
+        return data;
+      }
+
+      async function busy(buttonId, work) {
+        const button = buttonId && document.querySelector(buttonId);
+        if (button) button.disabled = true;
+        try { await work(); } catch (error) { status(error.message); }
+        finally { if (button) button.disabled = false; }
+      }
+
+      function fillProfile(profile) {
+        for (const field of listFields) form.elements[field].value = (profile[field] || []).join(", ");
+        form.elements.size_min.value = profile.contract_size_usd.min;
+        form.elements.size_max.value = profile.contract_size_usd.max;
+        form.elements.past_contracts.value = (profile.past_contracts || [])
+          .map(c => [c.client, c.summary, c.value_usd ?? ""].join(" | ").replace(/ \| $/, "")).join("\n");
+        document.querySelector("#profile-version").textContent = profile.profile_version ? ` Saved as version ${profile.profile_version}` : " Example profile, not saved yet";
+      }
+
+      function readProfile() {
+        const split = (value) => value.split(",").map(item => item.trim()).filter(Boolean);
+        const profile = {};
+        for (const field of listFields) profile[field] = split(form.elements[field].value);
+        profile.contract_size_usd = { min: Number(form.elements.size_min.value), max: Number(form.elements.size_max.value) };
+        profile.past_contracts = form.elements.past_contracts.value.split("\n").map(line => line.trim()).filter(Boolean).map(line => {
+          const [client, summary = "", value = ""] = line.split("|").map(part => part.trim());
+          return { client, summary, value_usd: value ? Number(value.replace(/[$,]/g, "")) : null };
+        });
+        return profile;
+      }
+
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        busy(null, async () => {
+          const saved = await request("/api/profile", { method: "PUT", body: JSON.stringify(readProfile()) });
+          fillProfile(saved);
+          status("Profile saved. Build the digest to match tenders against it.");
+          renderDigest([]);
+        });
+      });
+
+      function syncNotices() {
+        busy("#sync", async () => {
+          status("Downloading notices from SAM.gov…");
+          const result = await request("/api/sync", { method: "POST" });
+          status(`Fetched ${result.fetched} notices (${result.new} new, ${result.changed} amended).`);
+        });
+      }
+
+      function runDigest() {
+        busy("#run", async () => {
+          status("Reading shortlisted notices with the AI judge. This can take a minute…");
+          const run = await request("/api/digest/run", { method: "POST" });
+          renderDigest(run.items);
+          renderSkipped(run.skipped);
+          status(`${run.items.length} tenders in the digest (${run.judged} newly judged, ${run.reused} reused, ${run.skipped.length} skipped).`);
+        });
+      }
+
+      function loadDigest() { busy(null, async () => renderDigest(await request("/api/digest"))); }
+
+      function renderSkipped(skipped) {
+        const box = document.querySelector("#skipped-box");
+        const list = document.querySelector("#skipped");
+        list.replaceChildren();
+        box.hidden = skipped.length === 0;
+        document.querySelector("#skipped-title").textContent = `${skipped.length} notices skipped — why?`;
+        for (const item of skipped) {
+          const entry = document.createElement("li");
+          entry.textContent = `${item.title}: ${item.reason}`;
+          list.append(entry);
+        }
+      }
+
+      function el(tag, text, className) {
+        const node = document.createElement(tag);
+        if (text !== undefined) node.textContent = text;
+        if (className) node.className = className;
+        return node;
+      }
+
+      function criterion(label, quote) {
+        const entry = el("li", label);
+        if (quote) entry.append(el("blockquote", `“${quote}”`));
+        return entry;
+      }
+
+      async function sendFeedback(noticeId, decision, reasonCode = null, reasonText = null) {
+        try {
+          await request(`/api/feedback/${encodeURIComponent(noticeId)}`, {
+            method: "POST", body: JSON.stringify({ decision, reason_code: reasonCode, reason_text: reasonText })
+          });
+          status("Feedback saved. Thank you.");
+        } catch (error) { status(error.message); }
+      }
+
+      function renderDigest(items) {
+        const container = document.querySelector("#digest");
+        container.replaceChildren();
+        if (!items.length) { container.append(el("p", "No matches yet.", "muted")); return; }
+        for (const item of items) {
+          const card = el("article", undefined, `card ${item.fit}`);
+          const title = el("h3", item.tender.title);
+          card.append(title);
+          const header = el("p", undefined, "meta");
+          header.append(el("span", item.fit.toUpperCase(), `badge ${item.fit}`), ` ${item.reason_code} · ${item.tender.agency || "Agency not listed"}`);
+          card.append(header);
+          card.append(el("p", `Response deadline: ${item.tender.response_deadline || "not listed"} · Questions due: ${item.tender.questions_due || "not listed"}${item.tender.set_aside ? ` · Set-aside: ${item.tender.set_aside}` : ""}`, "meta"));
+          card.append(el("p", item.summary));
+
+          const reasons = el("ul");
+          for (const reason of item.fit_reasons) reasons.append(el("li", reason));
+          card.append(reasons);
+
+          const checklist = el("details");
+          checklist.append(el("summary", "Eligibility checklist with quotes from the notice"));
+          const criteria = el("ul");
+          for (const r of item.criteria.requirements) {
+            criteria.append(criterion(`${r.type === "eligibility" ? "Eligibility" : "Experience"}: ${r.requirement} — ${r.status.replace("_", " ")} (${r.weight})`, r.quote));
+          }
+          criteria.append(criterion(`Scope: ${item.criteria.scope.value}`, item.criteria.scope.quote));
+          criteria.append(criterion(`Size: ${item.criteria.size.value.replace("_", " ")}`, item.criteria.size.quote));
+          if (item.criteria.teaming_needed) criteria.append(el("li", "Teaming partner likely needed"));
+          checklist.append(criteria);
+          card.append(checklist);
+
+          if (item.tender.link) {
+            const link = el("a", "Open the official notice");
+            link.href = item.tender.link; link.target = "_blank"; link.rel = "noopener noreferrer";
+            card.append(link);
+          }
+
+          const feedback = el("div", undefined, "feedback");
+          const pursue = el("button", "Pursue");
+          pursue.onclick = () => sendFeedback(item.tender.notice_id, "pursue");
+          const reason = el("select");
+          reason.setAttribute("aria-label", "Reason this tender is not relevant");
+          for (const [value, label] of [["NO_ELIGIBILITY", "Not eligible"], ["NO_EXPERIENCE", "Lacks experience"], ["NO_SCOPE", "Wrong kind of work"], ["NO_SIZE", "Wrong size"], ["other", "Other…"]]) {
+            const option = el("option", label); option.value = value; reason.append(option);
+          }
+          const notRelevant = el("button", "Not relevant");
+          notRelevant.onclick = () => {
+            const reasonText = reason.value === "other" ? window.prompt("Why is this tender not relevant?") : null;
+            if (reason.value === "other" && !reasonText) return;
+            sendFeedback(item.tender.notice_id, "not_relevant", reason.value, reasonText);
+          };
+          feedback.append(pursue, reason, notRelevant);
+          card.append(feedback);
+          container.append(card);
+        }
+      }
+
+      request("/api/profile").then(profile => fillProfile(profile || sampleProfile)).catch(error => status(error.message));
+      loadDigest();
+    </script>
+  </body>
+</html>

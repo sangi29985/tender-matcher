@@ -1,0 +1,14 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: tender_matcher
+      POSTGRES_USER: tender_matcher
+      POSTGRES_PASSWORD: local-dev-only
+    ports:
+      - "5432:5432"
+    volumes:
+      - tender-matcher-db:/var/lib/postgresql/data
+
+volumes:
+  tender-matcher-db:

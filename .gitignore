@@ -18,3 +18,6 @@ data/raw/
 .idea/
 .vscode/
 .DS_Store
+
+# Local database
+*.db
