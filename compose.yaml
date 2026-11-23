@@ -1,14 +1,60 @@
+# Single-server deployment: Postgres, the web app, the daily worker, and (optionally) HTTPS.
+#   docker compose up -d --build                      # local: http://localhost:8000
+#   docker compose --profile https up -d --build      # live: https://$DOMAIN
+# Secrets (API keys, SMTP) come from .env; see .env.example and docs/operations.md.
 services:
   db:
-    image: pgvector/pgvector:pg16
+    image: postgres:16
     environment:
       POSTGRES_DB: tender_matcher
       POSTGRES_USER: tender_matcher
-      POSTGRES_PASSWORD: local-dev-only
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-dev-only}
     volumes:
       - tender-matcher-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tender_matcher -d tender_matcher"]
+      interval: 5s
+      retries: 10
+    restart: unless-stopped
+
+  web:
+    build: .
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql+psycopg://tender_matcher:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/tender_matcher
+    ports:
+      - "127.0.0.1:8000:8000"  # only reachable from this machine; Caddy serves the public site
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.jobs", "schedule"]
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgresql+psycopg://tender_matcher:${POSTGRES_PASSWORD:-local-dev-only}@db:5432/tender_matcher
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.8.4
+    profiles: ["https"]
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env for HTTPS}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on:
+      - web
+    restart: unless-stopped
 
 volumes:
   tender-matcher-db:
+  caddy-data:

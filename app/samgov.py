@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 from datetime import date, datetime
@@ -18,6 +19,31 @@ _BLOCK_TAGS = {
     "p", "div", "br", "li", "ul", "ol", "tr", "table", "h1", "h2", "h3", "h4", "h5", "h6",
     "section", "article", "header", "footer", "blockquote", "pre",
 }
+
+
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+async def get_with_retry(
+    http: httpx.AsyncClient, url, *, params=None, attempts: int = 4, base_delay: float = 2.0
+) -> httpx.Response:
+    """GET with backoff on rate limits, server errors and timeouts (SAM.gov has all three)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = await http.get(url, params=params)
+        except (httpx.TimeoutException, httpx.TransportError):
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(base_delay * 2 ** (attempt - 1))
+            continue
+        if response.status_code not in RETRY_STATUSES or attempt == attempts:
+            response.raise_for_status()
+            return response
+        retry_after = response.headers.get("retry-after", "")
+        delay = float(retry_after) if retry_after.isdigit() else base_delay * 2 ** (attempt - 1)
+        logger.warning("SAM.gov returned %s; retrying in %.0fs", response.status_code, delay)
+        await asyncio.sleep(min(delay, 60))
+    raise AssertionError("unreachable")
 
 
 def parse_sam_date(value: str | None) -> date | None:
@@ -79,6 +105,7 @@ def map_notice(data: dict[str, Any]) -> Tender:
         ),
         description="" if is_link else html_to_text(raw_description),
         description_url=raw_description if is_link else None,
+        resource_links=[link for link in data.get("resourceLinks") or [] if isinstance(link, str)],
         response_deadline=parse_sam_date(data.get("responseDeadLine")),
         questions_due=parse_sam_date(data.get("questionsDueDate")),
         notice_type=data.get("type") or "",
@@ -102,7 +129,8 @@ async def fetch_notices(
     offset = 0
     try:
         while True:
-            response = await http.get(
+            response = await get_with_retry(
+                http,
                 SAM_SEARCH_URL,
                 params={
                     "api_key": api_key,
@@ -112,7 +140,6 @@ async def fetch_notices(
                     "offset": offset,
                 },
             )
-            response.raise_for_status()
             payload = response.json()
             page = payload.get("opportunitiesData", [])
             for item in page:
@@ -131,6 +158,77 @@ async def fetch_notices(
     return notices
 
 
+def _with_api_key(link: str, api_key: str) -> httpx.URL:
+    url = httpx.URL(link)
+    host = url.host or ""
+    # Never send the API key to a host other than SAM.gov.
+    if host == "sam.gov" or host.endswith(".sam.gov"):
+        return url.copy_set_param("api_key", api_key)
+    return url
+
+
+def _filename(response: httpx.Response, fallback: str) -> str:
+    disposition = response.headers.get("content-disposition", "")
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition, re.IGNORECASE)
+    return match.group(1).strip() if match else fallback
+
+
+async def _download(
+    http: httpx.AsyncClient, url: httpx.URL, max_bytes: int
+) -> tuple[bytes, httpx.Response]:
+    async with http.stream("GET", url, follow_redirects=True) as response:
+        response.raise_for_status()
+        chunks, size = [], 0
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"Attachment is larger than {max_bytes} bytes")
+            chunks.append(chunk)
+        return b"".join(chunks), response
+
+
+async def fetch_attachments(
+    api_key: str,
+    links: list[str],
+    *,
+    max_files: int,
+    max_bytes: int,
+    char_limit: int,
+    client: httpx.AsyncClient | None = None,
+) -> str:
+    """Download a notice's attachments and return their combined text, labelled by file."""
+    from app.documents import UnsupportedDocument, extract_text
+
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=60)
+    sections: list[str] = []
+    try:
+        for index, link in enumerate(links[:max_files], start=1):
+            try:
+                content, response = await _download(http, _with_api_key(link, api_key), max_bytes)
+                name = _filename(response, f"attachment-{index}")
+                text = extract_text(
+                    content,
+                    content_type=response.headers.get("content-type", ""),
+                    filename=name,
+                )
+            except (httpx.HTTPError, ValueError, UnsupportedDocument) as exc:
+                logger.info("Skipping attachment %s: %s", index, exc)
+                continue
+            if text:
+                sections.append(f"=== Attachment: {name} ===\n{text}")
+        if len(links) > max_files:
+            sections.append(f"[{len(links) - max_files} more attachments were not read]")
+    finally:
+        if owns_client:
+            await http.aclose()
+
+    combined = "\n\n".join(sections)
+    if len(combined) > char_limit:
+        combined = combined[:char_limit] + "\n[Attachment text cut off here: too long to read]"
+    return combined
+
+
 async def fetch_description(
     api_key: str, url: str, *, client: httpx.AsyncClient | None = None
 ) -> str:
@@ -138,8 +236,7 @@ async def fetch_description(
     owns_client = client is None
     http = client or httpx.AsyncClient(timeout=30)
     try:
-        response = await http.get(url, params={"api_key": api_key})
-        response.raise_for_status()
+        response = await get_with_retry(http, url, params={"api_key": api_key})
         body = response.text
         if "json" in response.headers.get("content-type", ""):
             body = response.json().get("description") or ""

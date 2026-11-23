@@ -2,13 +2,9 @@ from datetime import date, timedelta
 from unittest.mock import patch
 
 import pytest
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
-from app import main
-from app.database import Base, TenderRecord, get_db
+from app import pipeline
+from app.database import TenderRecord
 from app.schemas import Judgment
 
 DEADLINE = date.today() + timedelta(days=30)
@@ -28,11 +24,11 @@ def tender_data(notice_id, title="Cloud migration support", **overrides):
     return data
 
 
-def judgment(scope_quote=GOOD_TEXT):
+def judgment(scope_quote=GOOD_TEXT, requirements=()):
     return Judgment.model_validate(
         {
             "criteria": {
-                "requirements": [],
+                "requirements": list(requirements),
                 "scope": {"value": "core", "quote": scope_quote},
                 "size": {"value": "unknown", "quote": ""},
                 "teaming_needed": False,
@@ -44,61 +40,32 @@ def judgment(scope_quote=GOOD_TEXT):
 
 
 @pytest.fixture
-def app_env():
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-    )
-    Base.metadata.create_all(engine)
-    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
-
-    def override_db():
-        session = session_factory()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    main.app.dependency_overrides[get_db] = override_db
-    settings = main.get_settings().model_copy(
-        update={"top_k": 5, "anthropic_api_key": "test-key", "sam_gov_api_key": "sam-key"}
-    )
-    calls: list[str] = []
+def env(session_factory):
+    calls: list[tuple[str, str]] = []
     answers: dict[str, Judgment] = {}
 
     async def fake_judge(tender, *_args, **_kwargs):
-        calls.append(tender.notice_id)
+        calls.append((tender.notice_id, tender.description))
         return answers.get(tender.notice_id, judgment()), "test-model"
 
-    def add(notice_id, description, **overrides):
+    def add(notice_id, description, attachments_text="", **overrides):
         with session_factory() as session:
             session.add(
                 TenderRecord(
                     notice_id=notice_id,
                     data=tender_data(notice_id, **overrides),
                     description=description,
+                    attachments_text=attachments_text,
                 )
             )
             session.commit()
 
-    with (
-        patch.object(main, "init_db"),
-        patch.object(main, "judge_tender", new=fake_judge),
-        patch.object(main, "get_settings", return_value=settings),
-        TestClient(main.app) as client,
-    ):
-        response = client.put(
-            "/api/profile",
-            json={"services": ["cloud migration"], "contract_size_usd": {"min": 1000, "max": 1e5}},
-        )
-        assert response.status_code == 200
-        yield client, add, calls, answers
-
-    main.app.dependency_overrides.pop(get_db, None)
-    engine.dispose()
+    with patch.object(pipeline, "judge_tender", new=fake_judge):
+        yield add, calls, answers
 
 
-def test_digest_run_scores_persists_and_accepts_feedback(app_env):
-    client, add, calls, _ = app_env
+def test_digest_run_scores_persists_and_accepts_feedback(client, env):
+    add, _, _ = env
     add("notice-1", GOOD_TEXT)
 
     response = client.post("/api/digest/run")
@@ -113,22 +80,22 @@ def test_digest_run_scores_persists_and_accepts_feedback(app_env):
     assert client.post("/api/feedback/notice-1", json={"decision": "pursue"}).status_code == 200
 
 
-def test_second_run_reuses_existing_judgments(app_env):
-    client, add, calls, _ = app_env
+def test_second_run_reuses_existing_judgments(client, env):
+    add, calls, _ = env
     add("notice-1", GOOD_TEXT)
 
     client.post("/api/digest/run")
     run = client.post("/api/digest/run").json()
-    assert calls == ["notice-1"]
+    assert len(calls) == 1
     assert run["reused"] == 1 and run["judged"] == 0
     assert len(run["items"]) == 1
 
     client.post("/api/digest/run", params={"rejudge": True})
-    assert calls == ["notice-1", "notice-1"]
+    assert len(calls) == 2
 
 
-def test_ungrounded_judgment_is_skipped_without_losing_others(app_env):
-    client, add, _, answers = app_env
+def test_ungrounded_judgment_is_skipped_without_losing_others(client, env):
+    add, _, answers = env
     add("good", GOOD_TEXT)
     add("bad", "Cloud migration for a small agency.", title="Cloud migration pilot")
     answers["bad"] = judgment(scope_quote="A quote that is not in the notice")
@@ -141,16 +108,45 @@ def test_ungrounded_judgment_is_skipped_without_losing_others(app_env):
     assert len(client.get("/api/digest").json()) == 1
 
 
-def test_description_is_downloaded_before_judging(app_env):
-    client, add, calls, _ = app_env
+def test_description_and_attachments_are_read_before_judging(client, env):
+    add, calls, answers = env
     url = "https://api.sam.gov/prod/opportunities/v1/noticedesc?noticeid=n1"
-    add("n1", "", description_url=url)
+    add("n1", "", attachments_text=None, description_url=url, resource_links=["https://sam.gov/f/1"])
+    attachment = "=== Attachment: sow.pdf ===\nOfferors must hold ISO 27001 certification."
+    answers["n1"] = judgment(
+        requirements=[
+            {
+                "type": "eligibility",
+                "requirement": "ISO 27001",
+                "weight": "major",
+                "status": "met",
+                "quote": "Offerors must hold ISO 27001 certification.",
+            }
+        ]
+    )
 
-    async def fake_fetch(api_key, fetched_url, **_kwargs):
+    async def fake_description(api_key, fetched_url, **_kwargs):
         assert (api_key, fetched_url) == ("sam-key", url)
         return GOOD_TEXT
 
-    with patch.object(main, "fetch_description", new=fake_fetch):
+    async def fake_attachments(api_key, links, **_kwargs):
+        assert links == ["https://sam.gov/f/1"]
+        return attachment
+
+    with (
+        patch.object(pipeline, "fetch_description", new=fake_description),
+        patch.object(pipeline, "fetch_attachments", new=fake_attachments),
+    ):
         run = client.post("/api/digest/run").json()
-    assert calls == ["n1"]
-    assert run["items"][0]["fit"] == "strong"
+    # The judge read both, and the quote from the attachment passed the check.
+    assert calls == [("n1", f"{GOOD_TEXT}\n\n{attachment}")]
+    assert run["items"][0]["fit"] == "strong", run
+
+
+def test_digest_requires_a_profile(make_client):
+    from tests.conftest import sign_up
+
+    client = make_client()
+    sign_up(client)
+    response = client.post("/api/digest/run")
+    assert response.status_code == 409

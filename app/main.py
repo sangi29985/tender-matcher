@@ -1,44 +1,82 @@
 import asyncio
 import logging
+import uuid
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import httpx
-from anthropic import AsyncAnthropic
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
-from app.checker import check_quotes
+from app.auth import (
+    CurrentUser,
+    consume_password_reset,
+    create_password_reset,
+    current_user,
+    end_session,
+    hash_password,
+    start_session,
+    verify_password,
+)
 from app.config import get_settings
 from app.database import (
+    CompanyRecord,
     FeedbackRecord,
+    JobRunRecord,
     MatchRecord,
     ProfileRecord,
+    SessionRecord,
     TenderRecord,
+    UserRecord,
     get_db,
     init_db,
 )
-from app.judge import PROMPT_VERSION, judge_tender
-from app.matcher import hard_filter, rank_tenders
-from app.rubric import RUBRIC_VERSION, score_criteria
-from app.samgov import fetch_description, fetch_notices
+from app.documents import UnsupportedDocument, extract_text
+from app.emailer import build_reset_email, email_configured, send_email
+from app.pipeline import (
+    PipelineError,
+    current_digest,
+    load_profile,
+    run_company_digest,
+    sync_tenders,
+)
+from app.profile_builder import draft_profile
+from app.rubric import RUBRIC_VERSION
 from app.schemas import (
+    AccountOut,
+    AccountSettings,
     CompanyProfile,
     DigestItem,
     DigestRun,
     FeedbackInput,
-    Judgment,
-    SkippedTender,
-    Tender,
+    LoginInput,
+    PasswordResetInput,
+    PasswordResetRequest,
+    ProfileDraft,
+    ProfileFields,
+    SignupInput,
 )
+from app.security import SecurityMiddleware, login_throttle
 
 logger = logging.getLogger(__name__)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
-FIT_ORDER = {"strong": 0, "possible": 1, "no": 2}
+MAX_UPLOAD_BYTES = 15_000_000
+# Compared against when an email is unknown, so failed logins take the same time either way.
+_DUMMY_HASH = hash_password("not-a-real-password")
 
 
 @asynccontextmanager
@@ -47,20 +85,14 @@ async def lifespan(_: FastAPI):
     yield
 
 
-app = FastAPI(title="Tender Matcher", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Tender Matcher", version="0.2.0", lifespan=lifespan)
+app.add_middleware(SecurityMiddleware, hsts=get_settings().cookie_secure)
 
 
-def _tender_from_record(record: TenderRecord) -> Tender:
-    # The fetched description text lives in its own column; `data` holds the API fields.
-    data = {**record.data, "description": record.description or ""}
-    if data["description"].startswith(("http://", "https://")) and not data.get("description_url"):
-        # Rows synced before descriptions were fetched stored the link as the text.
-        data["description_url"], data["description"] = data["description"], ""
-    return Tender.model_validate(data)
-
-
-def _digest_order(item: DigestItem) -> tuple[int, date]:
-    return FIT_ORDER[item.fit], item.tender.response_deadline or date.max
+def _pipeline_error(exc: PipelineError) -> HTTPException:
+    message = str(exc)
+    status = 409 if "profile" in message else 503
+    return HTTPException(status_code=status, detail=message)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -70,27 +102,199 @@ def home(request: Request):
 
 @app.get("/health")
 def health():
+    """Liveness: the process is up."""
     return {"status": "ok"}
 
 
+def _last_run(db: Session) -> JobRunRecord | None:
+    return db.scalar(select(JobRunRecord).order_by(JobRunRecord.started_at.desc()).limit(1))
+
+
+def _aware(value: datetime | None) -> datetime | None:
+    return value.replace(tzinfo=UTC) if value and value.tzinfo is None else value
+
+
+@app.get("/health/ready")
+def ready(response: Response, db: Session = Depends(get_db)):
+    """Readiness for uptime monitoring: database reachable and the daily data fresh."""
+    try:
+        db.execute(text("SELECT 1"))
+    except Exception:
+        logger.exception("Database check failed")
+        response.status_code = 503
+        return {"status": "error", "database": "unreachable"}
+    run = _last_run(db)
+    finished = _aware(run.finished_at) if run else None
+    stale_after = timedelta(hours=get_settings().stale_after_hours)
+    fresh = bool(finished and datetime.now(UTC) - finished < stale_after)
+    healthy = fresh and run.status == "ok"
+    if not healthy:
+        response.status_code = 503
+    return {
+        "status": "ok" if healthy else "degraded",
+        "database": "ok",
+        "last_daily_run": finished.isoformat() if finished else None,
+        "last_daily_status": run.status if run else None,
+    }
+
+
+# --- Accounts -------------------------------------------------------------------------------
+
+
+def _account(auth: CurrentUser, db: Session | None = None) -> AccountOut:
+    run = _last_run(db) if db is not None else None
+    return AccountOut(
+        email=auth.user.email,
+        company_name=auth.company.name,
+        email_digest=auth.company.email_digest,
+        email_configured=email_configured(get_settings()),
+        last_update=_aware(run.finished_at) if run and run.status == "ok" else None,
+    )
+
+
+@app.post("/api/auth/signup", response_model=AccountOut, status_code=201)
+def signup(payload: SignupInput, response: Response, db: Session = Depends(get_db)):
+    if not get_settings().allow_signup:
+        raise HTTPException(status_code=403, detail="Sign-up is closed")
+    email = payload.email.strip().lower()
+    if db.scalar(select(func.count()).select_from(UserRecord).where(UserRecord.email == email)):
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+    company = CompanyRecord(id=str(uuid.uuid4()), name=payload.company_name.strip())
+    user = UserRecord(
+        id=str(uuid.uuid4()),
+        email=email,
+        password_hash=hash_password(payload.password),
+        company_id=company.id,
+    )
+    db.add_all([company, user])
+    db.commit()
+    start_session(db, response, user.id)
+    return _account(CurrentUser(user=user, company=company))
+
+
+@app.post("/api/auth/login", response_model=AccountOut)
+def login(
+    payload: LoginInput, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    settings = get_settings()
+    email = payload.email.strip().lower()
+    address = request.client.host if request.client else "unknown"
+    keys = [f"email:{email}", f"ip:{address}"]
+    window = settings.login_lockout_minutes * 60
+    if login_throttle.blocked(keys[:1], settings.login_max_failures, window) or (
+        login_throttle.blocked(keys[1:], settings.login_max_failures * 5, window)
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed sign-ins. Try again in {settings.login_lockout_minutes} "
+            "minutes or reset your password.",
+        )
+    user = db.scalar(select(UserRecord).where(UserRecord.email == email))
+    valid = verify_password(payload.password, user.password_hash if user else _DUMMY_HASH)
+    if not user or not valid:
+        login_throttle.failed(keys)
+        raise HTTPException(status_code=401, detail="Email or password is incorrect")
+    login_throttle.succeeded(keys[:1])
+    start_session(db, response, user.id)
+    return _account(CurrentUser(user=user, company=db.get(CompanyRecord, user.company_id)), db)
+
+
+@app.post("/api/auth/reset-request", status_code=202)
+async def request_password_reset(payload: PasswordResetRequest, db: Session = Depends(get_db)):
+    """Email a reset link. Always answers the same way, so it can't reveal who has an account."""
+    settings = get_settings()
+    if not email_configured(settings):
+        raise HTTPException(
+            status_code=503,
+            detail="Password reset by email isn't set up on this server; contact the operator.",
+        )
+    user = db.scalar(select(UserRecord).where(UserRecord.email == payload.email.strip().lower()))
+    if user:
+        token = create_password_reset(db, user.id)
+        try:
+            await asyncio.to_thread(
+                send_email, build_reset_email(user.email, token, settings), settings
+            )
+        except Exception:
+            logger.exception("Could not send the password reset email")
+    return {"detail": "If that email has an account, a reset link is on its way."}
+
+
+@app.post("/api/auth/reset")
+def reset_password(payload: PasswordResetInput, db: Session = Depends(get_db)):
+    user = consume_password_reset(db, payload.token, payload.password)
+    if user is None:
+        raise HTTPException(status_code=400, detail="This reset link is invalid or has expired")
+    login_throttle.succeeded([f"email:{user.email}"])
+    return {"detail": "Password changed. Sign in with your new password."}
+
+
+@app.post("/api/auth/logout", status_code=204)
+def logout(request: Request, response: Response, db: Session = Depends(get_db)):
+    end_session(db, request, response)
+
+
+@app.get("/api/me", response_model=AccountOut)
+def me(auth: CurrentUser = Depends(current_user), db: Session = Depends(get_db)):
+    return _account(auth, db)
+
+
+@app.delete("/api/me", status_code=204)
+def delete_account(
+    request: Request,
+    response: Response,
+    auth: CurrentUser = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete the company, its users, profile, matches and feedback."""
+    end_session(db, request, response)
+    company_id = auth.company_id
+    user_ids = select(UserRecord.id).where(UserRecord.company_id == company_id)
+    db.execute(delete(SessionRecord).where(SessionRecord.user_id.in_(user_ids)))
+    for model in (FeedbackRecord, MatchRecord, ProfileRecord, UserRecord):
+        db.execute(delete(model).where(model.company_id == company_id))
+    db.execute(delete(CompanyRecord).where(CompanyRecord.id == company_id))
+    db.commit()
+
+
+@app.put("/api/me/settings", response_model=AccountOut)
+def update_settings(
+    payload: AccountSettings,
+    auth: CurrentUser = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    company = db.get(CompanyRecord, auth.company_id)
+    company.email_digest = payload.email_digest
+    db.commit()
+    return _account(CurrentUser(user=auth.user, company=company), db)
+
+
+# --- Profile --------------------------------------------------------------------------------
+
+
 @app.get("/api/profile", response_model=CompanyProfile | None)
-def read_profile(db: Session = Depends(get_db)):
-    record = db.get(ProfileRecord, "default")
-    return CompanyProfile.model_validate(record.profile) if record else None
+def read_profile(auth: CurrentUser = Depends(current_user), db: Session = Depends(get_db)):
+    return load_profile(db, auth.company_id)
 
 
 @app.put("/api/profile", response_model=CompanyProfile)
-def save_profile(profile: CompanyProfile, db: Session = Depends(get_db)):
-    current = db.get(ProfileRecord, "default")
+def save_profile(
+    fields: ProfileFields,
+    auth: CurrentUser = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    current = db.get(ProfileRecord, auth.company_id)
     version = current.profile_version + 1 if current else 1
-    profile = profile.model_copy(update={"company_id": "default", "profile_version": version})
+    profile = CompanyProfile(
+        **fields.model_dump(), company_id=auth.company_id, profile_version=version
+    )
     if current:
         current.profile_version = version
         current.profile = profile.model_dump(mode="json")
     else:
         db.add(
             ProfileRecord(
-                company_id="default",
+                company_id=auth.company_id,
                 profile_version=version,
                 profile=profile.model_dump(mode="json"),
             )
@@ -99,217 +303,93 @@ def save_profile(profile: CompanyProfile, db: Session = Depends(get_db)):
     return profile
 
 
+@app.post("/api/profile/draft", response_model=ProfileDraft)
+async def draft_profile_from_documents(
+    text: str = Form(default=""),
+    file: UploadFile | None = File(default=None),
+    auth: CurrentUser = Depends(current_user),
+):
+    """Propose a profile from a capability statement. Nothing is saved until the owner saves."""
+    if not get_settings().anthropic_api_key:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured")
+    source = text.strip()
+    if file is not None and file.filename:
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="The file is larger than 15 MB")
+        try:
+            document = extract_text(
+                content, content_type=file.content_type or "", filename=file.filename
+            )
+        except UnsupportedDocument as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        source = f"{source}\n\n=== {file.filename} ===\n{document}".strip()
+    try:
+        return await draft_profile(source, get_settings())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Profile draft failed for company %s", auth.company_id)
+        raise HTTPException(
+            status_code=502, detail="Could not draft a profile; see server logs"
+        ) from exc
+
+
+# --- Tenders and digest ---------------------------------------------------------------------
+
+
 @app.post("/api/sync")
 async def sync_notices(
     posted_from: date | None = Query(default=None),
     posted_to: date | None = Query(default=None),
+    _: CurrentUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    settings = get_settings()
-    if not settings.sam_gov_api_key:
-        raise HTTPException(status_code=503, detail="SAM_GOV_API_KEY is not configured")
     end = posted_to or date.today()
     start = posted_from or end - timedelta(days=3)
     if start > end:
         raise HTTPException(status_code=422, detail="posted_from must not be after posted_to")
+    if (end - start).days > 31:
+        raise HTTPException(status_code=422, detail="Sync at most 31 days at a time")
     try:
-        tenders = await fetch_notices(settings.sam_gov_api_key, start, end)
+        result = await sync_tenders(db, get_settings(), start, end)
+    except PipelineError as exc:
+        raise _pipeline_error(exc) from exc
     except (httpx.HTTPError, ValueError, KeyError) as exc:
         logger.exception("SAM.gov sync failed")
         raise HTTPException(status_code=502, detail="SAM.gov sync failed; see server logs") from exc
-
-    new = changed = 0
-    for tender in tenders:
-        record = db.get(TenderRecord, tender.notice_id)
-        serialized = tender.model_dump(mode="json", exclude={"description"})
-        if record is None:
-            db.add(
-                TenderRecord(
-                    notice_id=tender.notice_id, data=serialized, description=tender.description
-                )
-            )
-            new += 1
-        elif record.data != serialized:
-            # Amended notice: store the new fields, refetch its text, and judge it again.
-            record.data = serialized
-            record.description = tender.description
-            db.execute(delete(MatchRecord).where(MatchRecord.notice_id == tender.notice_id))
-            changed += 1
-    db.commit()
-    return {
-        "fetched": len(tenders),
-        "new": new,
-        "changed": changed,
-        "posted_from": start,
-        "posted_to": end,
-    }
+    return {**result, "posted_from": start, "posted_to": end}
 
 
 @app.post("/api/digest/run", response_model=DigestRun)
 async def run_digest(
     rejudge: bool = Query(default=False, description="Judge again even if a match exists"),
+    auth: CurrentUser = Depends(current_user),
     db: Session = Depends(get_db),
 ):
-    settings = get_settings()
-    profile_record = db.get(ProfileRecord, "default")
-    if not profile_record:
-        raise HTTPException(
-            status_code=409, detail="Save a company profile before running the digest"
-        )
-    profile = CompanyProfile.model_validate(profile_record.profile)
-    records = {record.notice_id: record for record in db.scalars(select(TenderRecord)).all()}
-    tenders = [_tender_from_record(record) for record in records.values()]
-    candidates = rank_tenders(hard_filter(tenders, profile), profile, settings.top_k)
-
-    existing = {
-        match.notice_id: match
-        for match in db.scalars(
-            select(MatchRecord).where(
-                MatchRecord.company_id == "default",
-                MatchRecord.profile_version == profile.profile_version,
-                MatchRecord.prompt_version == PROMPT_VERSION,
-            )
-        ).all()
-    }
-    items: list[DigestItem] = []
-    skipped: list[SkippedTender] = []
-    to_judge: list[Tender] = []
-
-    def skip(tender: Tender, reason: str) -> None:
-        skipped.append(SkippedTender(notice_id=tender.notice_id, title=tender.title, reason=reason))
-
-    for tender in candidates:
-        match = existing.get(tender.notice_id)
-        if match and not rejudge:
-            items.append(_item_from_match(match, tender))
-        else:
-            to_judge.append(tender)
-
-    if to_judge and not settings.anthropic_api_key:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY is not configured")
-
-    # Fetch description text only for the tenders we are about to judge.
-    ready: list[Tender] = []
-    async with httpx.AsyncClient(timeout=30) as http:
-        for tender in to_judge:
-            if not tender.description and tender.description_url:
-                if not settings.sam_gov_api_key:
-                    skip(tender, "Description not downloaded: SAM_GOV_API_KEY is not configured")
-                    continue
-                try:
-                    text = await fetch_description(
-                        settings.sam_gov_api_key, tender.description_url, client=http
-                    )
-                except httpx.HTTPError:
-                    logger.exception("Description fetch failed for %s", tender.notice_id)
-                    skip(tender, "Could not download the notice description from SAM.gov")
-                    continue
-                records[tender.notice_id].description = text
-                tender = tender.model_copy(update={"description": text})
-            if not tender.description.strip():
-                skip(tender, "The notice has no description text to assess")
-                continue
-            ready.append(tender)
-    db.commit()
-
-    client = AsyncAnthropic(api_key=settings.anthropic_api_key) if ready else None
-    limit = asyncio.Semaphore(settings.judge_concurrency)
-
-    async def judge(tender: Tender) -> tuple[Judgment, str]:
-        async with limit:
-            return await judge_tender(tender, profile, settings, client=client)
-
-    results = await asyncio.gather(*(judge(t) for t in ready), return_exceptions=True)
-    judged = 0
-    for tender, result in zip(ready, results, strict=True):
-        if isinstance(result, BaseException):
-            logger.error("Judgment failed for %s", tender.notice_id, exc_info=result)
-            skip(tender, "The model call failed; see server logs")
-            continue
-        judgment, model = result
-        quote_errors = check_quotes(judgment.criteria, tender.description)
-        if quote_errors:
-            logger.warning("Ungrounded judgment for %s: %s", tender.notice_id, quote_errors)
-            skip(tender, "The judgment quoted text that is not in the notice")
-            continue
-        score = score_criteria(judgment.criteria)
-        values = {
-            "criteria": judgment.criteria.model_dump(mode="json"),
-            "fit": score.fit.value,
-            "reason_code": score.reason_code,
-            "fit_reasons": judgment.fit_reasons,
-            "summary": judgment.summary,
-            "rubric_version": RUBRIC_VERSION,
-            "prompt_version": PROMPT_VERSION,
-            "model": model,
-        }
-        match = existing.get(tender.notice_id)
-        if match:
-            for name, value in values.items():
-                setattr(match, name, value)
-        else:
-            match = MatchRecord(
-                company_id="default",
-                notice_id=tender.notice_id,
-                profile_version=profile.profile_version,
-                **values,
-            )
-            db.add(match)
-        items.append(_item_from_match(match, tender))
-        judged += 1
-
-    db.commit()
-    return DigestRun(
-        items=sorted(items, key=_digest_order),
-        judged=judged,
-        reused=len(candidates) - len(to_judge),
-        skipped=skipped,
-    )
-
-
-def _item_from_match(match: MatchRecord, tender: Tender) -> DigestItem:
-    return DigestItem(
-        tender=tender,
-        criteria=match.criteria,
-        fit=match.fit,
-        reason_code=match.reason_code,
-        fit_reasons=match.fit_reasons,
-        summary=match.summary,
-        rubric_version=match.rubric_version,
-        prompt_version=match.prompt_version,
-        model=match.model,
-    )
+    try:
+        return await run_company_digest(db, auth.company_id, get_settings(), rejudge=rejudge)
+    except PipelineError as exc:
+        raise _pipeline_error(exc) from exc
 
 
 @app.get("/api/digest", response_model=list[DigestItem])
-def get_digest(db: Session = Depends(get_db)):
-    profile_record = db.get(ProfileRecord, "default")
-    if not profile_record:
-        return []
-    matches = db.scalars(
-        select(MatchRecord).where(
-            MatchRecord.company_id == "default",
-            MatchRecord.profile_version == profile_record.profile_version,
-            MatchRecord.prompt_version == PROMPT_VERSION,
-        )
-    ).all()
-    digest: list[DigestItem] = []
-    for match in matches:
-        tender_record = db.get(TenderRecord, match.notice_id)
-        if tender_record:
-            digest.append(_item_from_match(match, _tender_from_record(tender_record)))
-    return sorted(digest, key=_digest_order)
+def get_digest(auth: CurrentUser = Depends(current_user), db: Session = Depends(get_db)):
+    return current_digest(db, auth.company_id)
 
 
 @app.post("/api/feedback/{notice_id}")
 def submit_feedback(
-    notice_id: str, feedback: FeedbackInput, db: Session = Depends(get_db)
+    notice_id: str,
+    feedback: FeedbackInput,
+    auth: CurrentUser = Depends(current_user),
+    db: Session = Depends(get_db),
 ):
     if not db.get(TenderRecord, notice_id):
         raise HTTPException(status_code=404, detail="Tender not found")
     db.add(
         FeedbackRecord(
-            company_id="default",
+            company_id=auth.company_id,
             notice_id=notice_id,
             decision=feedback.decision,
             reason_code=feedback.reason_code,

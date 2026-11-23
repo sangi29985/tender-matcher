@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
@@ -56,11 +56,9 @@ class PastContract(BaseModel):
     value_usd: float | None = Field(default=None, ge=0)
 
 
-class CompanyProfile(BaseModel):
+class ProfileFields(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    company_id: str = "default"
-    profile_version: int = Field(default=1, ge=1)
     services: list[str] = Field(min_length=1)
     naics_codes: list[str] = Field(default_factory=list)
     set_aside_eligibility: list[str] = Field(default_factory=list)
@@ -70,6 +68,55 @@ class CompanyProfile(BaseModel):
     clearances: list[str] = Field(default_factory=list)
     past_contracts: list[PastContract] = Field(default_factory=list)
     exclusions: list[str] = Field(default_factory=list)
+
+
+class CompanyProfile(ProfileFields):
+    company_id: str = ""
+    profile_version: int = Field(default=1, ge=1)
+
+
+class ProfileDraft(BaseModel):
+    """A profile proposed from company documents; the owner reviews it before saving."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    profile: ProfileFields
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Anything guessed, ambiguous or missing that the owner should check.",
+    )
+
+
+class SignupInput(BaseModel):
+    company_name: str = Field(min_length=1, max_length=200)
+    email: str = Field(min_length=3, max_length=320, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    password: str = Field(min_length=10, max_length=200)
+
+
+class LoginInput(BaseModel):
+    email: str = Field(max_length=320)
+    password: str = Field(max_length=200)
+
+
+class AccountOut(BaseModel):
+    email: str
+    company_name: str
+    email_digest: bool
+    email_configured: bool
+    last_update: datetime | None = None
+
+
+class PasswordResetRequest(BaseModel):
+    email: str = Field(max_length=320)
+
+
+class PasswordResetInput(BaseModel):
+    token: str = Field(min_length=10, max_length=200)
+    password: str = Field(min_length=10, max_length=200)
+
+
+class AccountSettings(BaseModel):
+    email_digest: bool
 
 
 class Requirement(BaseModel):
@@ -109,6 +156,7 @@ class Tender(BaseModel):
     agency: str = ""
     description: str = ""
     description_url: str | None = None
+    resource_links: list[str] = Field(default_factory=list)
     response_deadline: date | None = None
     questions_due: date | None = None
     notice_type: str = ""

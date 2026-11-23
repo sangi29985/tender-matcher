@@ -32,14 +32,72 @@
       .feedback { display: flex; flex-wrap: wrap; gap: .25rem; align-items: center; margin-top: .5rem; }
       .feedback select { width: auto; }
       details summary { cursor: pointer; }
+      .topbar { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; justify-content: space-between; }
+      .account { display: flex; flex-wrap: wrap; gap: .5rem 1rem; align-items: center; font-size: .9rem; }
+      .account label { display: inline-flex; gap: .35rem; align-items: center; font-weight: 400; }
+      .account input[type=checkbox] { width: auto; }
+      .auth { max-width: 420px; }
+      .auth form { display: grid; gap: .6rem; }
+      .tabs button.active { background: var(--ink); color: #fff; border-color: var(--ink); }
+      .notes { background: #fff8e6; border: 1px solid #f0d58a; border-radius: 8px; padding: .5rem 1rem; }
+      [hidden] { display: none !important; }
     </style>
   </head>
   <body>
-    <h1>Tender Matcher</h1>
+    <div class="topbar">
+      <h1>Tender Matcher</h1>
+      <div class="account" id="account" hidden>
+        <span id="account-name"></span>
+        <span id="last-update" class="muted"></span>
+        <label><input type="checkbox" id="email-digest" onchange="saveEmailSetting()"> Daily email digest</label>
+        <button onclick="logout()">Sign out</button>
+        <button onclick="deleteAccount()" title="Permanently delete this company and its data">Delete account</button>
+      </div>
+    </div>
     <p class="muted">Decision support only. Always confirm eligibility, dates and bid details in the official notice on SAM.gov.</p>
+    <p id="auth-status" role="status"></p>
+
+    <section class="panel auth" id="auth" hidden>
+      <div class="tabs">
+        <button id="tab-login" class="active" onclick="showAuth('login')">Sign in</button>
+        <button id="tab-signup" onclick="showAuth('signup')">Create account</button>
+      </div>
+      <form id="login-form">
+        <label>Email<input name="email" type="email" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="primary" type="submit">Sign in</button>
+        <a href="#" onclick="showAuth('forgot'); return false;">Forgot your password?</a>
+      </form>
+      <form id="forgot-form" hidden>
+        <label>Email<input name="email" type="email" autocomplete="username" required></label>
+        <button class="primary" type="submit">Email me a reset link</button>
+      </form>
+      <form id="reset-form" hidden>
+        <label>New password <span>At least 10 characters</span><input name="password" type="password" minlength="10" autocomplete="new-password" required></label>
+        <button class="primary" type="submit">Set new password</button>
+      </form>
+      <form id="signup-form" hidden>
+        <label>Company name<input name="company_name" required></label>
+        <label>Email<input name="email" type="email" autocomplete="username" required></label>
+        <label>Password <span>At least 10 characters</span><input name="password" type="password" minlength="10" autocomplete="new-password" required></label>
+        <button class="primary" type="submit">Create account</button>
+      </form>
+    </section>
+
+    <div id="app" hidden>
 
     <section class="panel">
       <h2>1. Company profile</h2>
+      <details id="draft-box">
+        <summary>Fill it in from your capability statement</summary>
+        <p class="muted">Upload a capability statement (PDF, DOCX or text) or paste your website's services text. The AI drafts the profile below; nothing is saved until you review it and click Save.</p>
+        <form id="draft-form" class="grid">
+          <label class="wide">Paste text<textarea name="text"></textarea></label>
+          <label>Or upload a file<input name="file" type="file" accept=".pdf,.docx,.txt,.md,.html"></label>
+          <div><button id="draft" type="submit">Draft profile</button></div>
+        </form>
+      </details>
+      <div id="draft-notes" class="notes" hidden><strong>Please check:</strong><ul></ul></div>
       <form id="profile-form" class="grid">
         <label class="wide">Services you deliver <span>Comma-separated, e.g. cloud migration, IT helpdesk</span>
           <input name="services" required></label>
@@ -71,6 +129,7 @@
 
     <h2>3. Digest</h2>
     <section id="digest"><p class="muted">No matches yet.</p></section>
+    </div>
 
     <script>
       const sampleProfile = {
@@ -87,7 +146,10 @@
       const status = (message) => { document.querySelector("#status").textContent = message; };
 
       async function request(url, options = {}) {
-        const response = await fetch(url, { ...options, headers: { "Content-Type": "application/json", ...options.headers } });
+        const headers = { "X-Requested-With": "tender-matcher" };
+        if (typeof options.body === "string") headers["Content-Type"] = "application/json";
+        const response = await fetch(url, { ...options, headers: { ...headers, ...options.headers } });
+        if (response.status === 401 && !url.startsWith("/api/auth/")) { showSignedOut(); throw new Error("Please sign in"); }
         const text = await response.text();
         let data = null;
         try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
@@ -98,6 +160,106 @@
         }
         return data;
       }
+
+      function showSignedOut() {
+        document.querySelector("#app").hidden = true;
+        document.querySelector("#account").hidden = true;
+        document.querySelector("#auth").hidden = false;
+      }
+
+      function showAccount(account) {
+        document.querySelector("#auth").hidden = true;
+        document.querySelector("#app").hidden = false;
+        document.querySelector("#account").hidden = false;
+        document.querySelector("#auth-status").textContent = "";
+        document.querySelector("#account-name").textContent = `${account.company_name} · ${account.email}`;
+        const toggle = document.querySelector("#email-digest");
+        toggle.checked = account.email_digest;
+        toggle.disabled = !account.email_configured;
+        toggle.parentElement.title = account.email_configured ? "" : "Email is not set up on this server yet";
+        document.querySelector("#last-update").textContent = account.last_update
+          ? `· Tenders last updated ${new Date(account.last_update).toLocaleString()}`
+          : "· Daily update has not run yet";
+        loadApp();
+      }
+
+      function showAuth(mode) {
+        for (const name of ["login", "signup", "forgot", "reset"]) {
+          document.querySelector(`#${name}-form`).hidden = mode !== name;
+        }
+        document.querySelector("#tab-login").classList.toggle("active", mode === "login");
+        document.querySelector("#tab-signup").classList.toggle("active", mode === "signup");
+      }
+
+      for (const [formId, url] of [["#login-form", "/api/auth/login"], ["#signup-form", "/api/auth/signup"]]) {
+        document.querySelector(formId).addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const body = Object.fromEntries(new FormData(event.target));
+          try { showAccount(await request(url, { method: "POST", body: JSON.stringify(body) })); }
+          catch (error) { document.querySelector("#auth-status").textContent = error.message; }
+        });
+      }
+
+      document.querySelector("#forgot-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const body = JSON.stringify(Object.fromEntries(new FormData(event.target)));
+        try {
+          const result = await request("/api/auth/reset-request", { method: "POST", body });
+          document.querySelector("#auth-status").textContent = result.detail;
+        } catch (error) { document.querySelector("#auth-status").textContent = error.message; }
+      });
+
+      document.querySelector("#reset-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const token = new URLSearchParams(location.hash.slice(1)).get("reset");
+        const password = new FormData(event.target).get("password");
+        try {
+          const result = await request("/api/auth/reset", { method: "POST", body: JSON.stringify({ token, password }) });
+          history.replaceState(null, "", location.pathname);
+          showAuth("login");
+          document.querySelector("#auth-status").textContent = result.detail;
+        } catch (error) { document.querySelector("#auth-status").textContent = error.message; }
+      });
+
+      async function deleteAccount() {
+        const answer = window.prompt("This permanently deletes your company, profile, matches and feedback. Type DELETE to confirm.");
+        if (answer !== "DELETE") return;
+        try {
+          await request("/api/me", { method: "DELETE" });
+          renderDigest([]);
+          showSignedOut();
+          document.querySelector("#auth-status").textContent = "Your account and data were deleted.";
+        } catch (error) { status(error.message); }
+      }
+
+      async function logout() {
+        await request("/api/auth/logout", { method: "POST" }).catch(() => {});
+        renderDigest([]);
+        showSignedOut();
+      }
+
+      async function saveEmailSetting() {
+        const enabled = document.querySelector("#email-digest").checked;
+        try {
+          await request("/api/me/settings", { method: "PUT", body: JSON.stringify({ email_digest: enabled }) });
+          status(enabled ? "Daily email digest on." : "Daily email digest off.");
+        } catch (error) { status(error.message); }
+      }
+
+      document.querySelector("#draft-form").addEventListener("submit", (event) => {
+        event.preventDefault();
+        busy("#draft", async () => {
+          status("Reading your documents and drafting a profile…");
+          const draft = await request("/api/profile/draft", { method: "POST", body: new FormData(event.target) });
+          fillProfile({ ...draft.profile, profile_version: null });
+          const notes = document.querySelector("#draft-notes");
+          const list = notes.querySelector("ul");
+          list.replaceChildren(...draft.notes.map(note => el("li", note)));
+          notes.hidden = draft.notes.length === 0;
+          document.querySelector("#draft-box").open = false;
+          status("Draft ready. Review every field, then click Save profile.");
+        });
+      });
 
       async function busy(buttonId, work) {
         const button = buttonId && document.querySelector(buttonId);
@@ -112,7 +274,7 @@
         form.elements.size_max.value = profile.contract_size_usd.max;
         form.elements.past_contracts.value = (profile.past_contracts || [])
           .map(c => [c.client, c.summary, c.value_usd ?? ""].join(" | ").replace(/ \| $/, "")).join("\n");
-        document.querySelector("#profile-version").textContent = profile.profile_version ? ` Saved as version ${profile.profile_version}` : " Example profile, not saved yet";
+        document.querySelector("#profile-version").textContent = profile.profile_version ? ` Saved as version ${profile.profile_version}` : " Not saved yet";
       }
 
       function readProfile() {
@@ -132,6 +294,7 @@
         busy(null, async () => {
           const saved = await request("/api/profile", { method: "PUT", body: JSON.stringify(readProfile()) });
           fillProfile(saved);
+          document.querySelector("#draft-notes").hidden = true;
           status("Profile saved. Build the digest to match tenders against it.");
           renderDigest([]);
         });
@@ -248,8 +411,21 @@
         }
       }
 
-      request("/api/profile").then(profile => fillProfile(profile || sampleProfile)).catch(error => status(error.message));
-      loadDigest();
+      function loadApp() {
+        request("/api/profile").then(profile => {
+          fillProfile(profile || { ...sampleProfile, profile_version: null });
+          if (!profile) document.querySelector("#draft-box").open = true;
+        }).catch(error => status(error.message));
+        loadDigest();
+      }
+
+      if (location.hash.startsWith("#reset=")) {
+        showSignedOut();
+        showAuth("reset");
+        document.querySelector("#auth-status").textContent = "Choose a new password.";
+      } else {
+        request("/api/me").then(showAccount).catch(() => showSignedOut());
+      }
     </script>
   </body>
 </html>
